@@ -118,52 +118,68 @@ class CapsuleLayer(layers.Layer):
         self.built = True
 
     def call(self, inputs, training=None):
-        # inputs.shape=[None, input_num_capsule, input_dim_capsule]
-        # inputs_expand.shape=[None, 1, input_num_capsule, input_dim_capsule]
-        inputs_expand = K.expand_dims(inputs, 1)
+      # Expand the input in axis=1, tile in that axis to num_capsule, and 
+      # expands another axis at the end to prepare the multiplication with W.
+      #  inputs.shape=[None, input_num_capsule, input_dim_capsule]
+      #  inputs_expand.shape=[None, 1, input_num_capsule, input_dim_capsule]
+      #  inputs_tiled.shape=[None, num_capsule, input_num_capsule, 
+      #                            input_dim_capsule, 1]
+      inputs_expand = tf.expand_dims(inputs, 1)
+      inputs_tiled  = tf.tile(inputs_expand, [1, self.num_capsule, 1, 1])
+      inputs_tiled  = tf.expand_dims(inputs_tiled, 4)
 
-        # Replicate num_capsule dimension to prepare being multiplied by W
-        # inputs_tiled.shape=[None, num_capsule, input_num_capsule, input_dim_capsule]
-        inputs_tiled = K.tile(inputs_expand, [1, self.num_capsule, 1, 1])
+      # Compute `W * inputs` by scanning inputs_tiled on dimension 0 (map_fn).
+      # - Use matmul (without transposing any element). Note the order!
+      # Thus:
+      #  x.shape=[num_capsule, input_num_capsule, input_dim_capsule, 1]
+      #  W.shape=[num_capsule, input_num_capsule, dim_capsule,input_dim_capsule]
+      # Regard the first two dimensions as `batch` dimension,
+      # then matmul: [dim_capsule, input_dim_capsule] x [input_dim_capsule, 1]-> 
+      #              [dim_capsule, 1].
+      #  inputs_hat.shape=[None, num_capsule, input_num_capsule, dim_capsule, 1]
 
-        # Compute `inputs * W` by scanning inputs_tiled on dimension 0.
-        # x.shape=[num_capsule, input_num_capsule, input_dim_capsule]
-        # W.shape=[num_capsule, input_num_capsule, dim_capsule, input_dim_capsule]
-        # Regard the first two dimensions as `batch` dimension,
-        # then matmul: [input_dim_capsule] x [dim_capsule, input_dim_capsule]^T -> [dim_capsule].
-        # inputs_hat.shape = [None, num_capsule, input_num_capsule, dim_capsule]
-        inputs_hat = K.map_fn(lambda x: K.batch_dot(x, self.W, [2, 3]), elems=inputs_tiled)
+      inputs_hat = tf.map_fn(lambda x: tf.matmul(self.W, x), elems=inputs_tiled)     
 
-        # Begin: Routing algorithm ---------------------------------------------------------------------#
-        # The prior for coupling coefficient, initialized as zeros.
-        # b.shape = [None, self.num_capsule, self.input_num_capsule].
-        b = tf.zeros(shape=[K.shape(inputs_hat)[0], self.num_capsule, self.input_num_capsule])
+      # Begin: Routing algorithm ----------------------------------------------#
+      # The prior for coupling coefficient, initialized as zeros.
+      #  b.shape = [None, self.num_capsule, self.input_num_capsule, 1, 1].
+      b = tf.zeros(shape=[tf.shape(inputs_hat)[0], self.num_capsule, 
+                          self.input_num_capsule, 1, 1])
 
-        assert self.routings > 0, 'The routings should be > 0.'
-        for i in range(self.routings):
-            # c.shape=[batch_size, num_capsule, input_num_capsule]
-            try:
-                c = tf.nn.softmax(b, axis=1)
-            except:
-                print("something is wrong")
+      assert self.routings > 0, 'The routings should be > 0.'
+      for i in range(self.routings):
+        # Apply softmax to the axis with `num_capsule`
+        #  c.shape=[batch_size, num_capsule, input_num_capsule, 1, 1]
+        c = layers.Softmax(axis=1)(b)
 
-            # c.shape =  [batch_size, num_capsule, input_num_capsule]
-            # inputs_hat.shape=[None, num_capsule, input_num_capsule, dim_capsule]
-            # The first two dimensions as `batch` dimension,
-            # then matmal: [input_num_capsule] x [input_num_capsule, dim_capsule] -> [dim_capsule].
-            # outputs.shape=[None, num_capsule, dim_capsule]
-            outputs = squash(K.batch_dot(c, inputs_hat, [2, 2]))  # [None, 10, 16]
+        # Compute the weighted sum of all the predicted output vectors.
+        #  c.shape =  [batch_size, num_capsule, input_num_capsule, 1, 1]
+        #  inputs_hat.shape=[None, num_capsule, input_num_capsule,dim_capsule,1]
+        # The function `multiply` will broadcast axis=3 in c to dim_capsule.
+        #  outputs.shape=[None, num_capsule, input_num_capsule, dim_capsule, 1]
+        # Then sum along the input_num_capsule
+        #  outputs.shape=[None, num_capsule, 1, dim_capsule, 1]
+        # Then apply squash along the dim_capsule
+        outputs = tf.multiply(c, inputs_hat)
+        outputs = tf.reduce_sum(outputs, axis=2, keepdims=True)
+        outputs = squash(outputs, axis=-2)  # [None, 10, 1, 16, 1]
 
-            if i < self.routings - 1:
-                # outputs.shape =  [None, num_capsule, dim_capsule]
-                # inputs_hat.shape=[None, num_capsule, input_num_capsule, dim_capsule]
-                # The first two dimensions as `batch` dimension,
-                # then matmal: [dim_capsule] x [input_num_capsule, dim_capsule]^T -> [input_num_capsule].
-                # b.shape=[batch_size, num_capsule, input_num_capsule]
-                b += K.batch_dot(outputs, inputs_hat, [2, 3])
-        # End: Routing algorithm -----------------------------------------------------------------------#
+        if i < self.routings - 1:
+          # Update the prior b.
+          #  outputs.shape =  [None, num_capsule, 1, dim_capsule, 1]
+          #  inputs_hat.shape=[None,num_capsule,input_num_capsule,dim_capsule,1]
+          # Multiply the outputs with the weighted_inputs (inputs_hat) and add  
+          # it to the prior b.  
+          outputs_tiled = tf.tile(outputs, [1, 1, self.input_num_capsule, 1, 1])
+          agreement = tf.matmul(inputs_hat, outputs_tiled, transpose_a=True)
+          b = tf.add(b, agreement)
 
-        return outputs
+      # End: Routing algorithm ------------------------------------------------#
+      # Squeeze the outputs to remove useless axis:
+      #  From  --> outputs.shape=[None, num_capsule, 1, dim_capsule, 1]
+      #  To    --> outputs.shape=[None, num_capsule,    dim_capsule]
+      outputs = tf.squeeze(outputs, [2, 4])
+      return outputs
 
     def compute_output_shape(self, input_shape):
         return tuple([None, self.num_capsule, self.dim_capsule])
